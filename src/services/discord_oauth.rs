@@ -18,6 +18,11 @@ struct DiscordUser {
 struct DiscordGuild {
     id: String,
     name: String,
+    // Discord returns permissions as a string-encoded u64 bitflag.
+    #[serde(default)]
+    permissions: String,
+    #[serde(default)]
+    owner: bool,
 }
 
 pub struct DiscordOAuth {
@@ -108,10 +113,12 @@ impl DiscordOAuth {
         Ok((user.id, display_name))
     }
 
+    /// Returns `(guild_id, guild_name, manage_guild)` for each guild the user belongs to.
+    /// `manage_guild` is true if the user is the guild owner or has the MANAGE_GUILD permission bit.
     pub async fn get_user_guilds(
         &self,
         access_token: &str,
-    ) -> Result<Vec<(String, String)>, AppError> {
+    ) -> Result<Vec<(String, String, bool)>, AppError> {
         let guilds: Vec<DiscordGuild> = self
             .http
             .get("https://discord.com/api/v10/users/@me/guilds")
@@ -123,6 +130,15 @@ impl DiscordOAuth {
             .await
             .map_err(|e| AppError::Internal(format!("Discord guilds parse failed: {e}")))?;
 
-        Ok(guilds.into_iter().map(|g| (g.id, g.name)).collect())
+        // MANAGE_GUILD = 0x20 (bit 5) in the Discord permissions bitfield.
+        const MANAGE_GUILD: u64 = 0x20;
+        Ok(guilds
+            .into_iter()
+            .map(|g| {
+                let perms = g.permissions.parse::<u64>().unwrap_or(0);
+                let manage = g.owner || (perms & MANAGE_GUILD) != 0;
+                (g.id, g.name, manage)
+            })
+            .collect())
     }
 }

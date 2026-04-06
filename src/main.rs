@@ -57,6 +57,8 @@ async fn main() {
             .route("/login", get(routes::oauth::login))
             .route("/callback", get(routes::oauth::callback))
             .route("/logout", post(routes::oauth::logout))
+            .route("/guild_permission", get(routes::oauth::guild_permission))
+            .route("/guild_members", get(routes::oauth::guild_members))
             .route("/health", get(routes::health::health))
         )
         .layer(TraceLayer::new_for_http())

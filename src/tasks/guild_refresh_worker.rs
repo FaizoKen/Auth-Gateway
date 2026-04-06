@@ -101,15 +101,17 @@ async fn refresh_user_guilds(
         .await?;
 
     if !guilds.is_empty() {
-        let guild_ids: Vec<&str> = guilds.iter().map(|(id, _)| id.as_str()).collect();
-        let guild_names: Vec<&str> = guilds.iter().map(|(_, name)| name.as_str()).collect();
+        let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _)| id.as_str()).collect();
+        let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _)| name.as_str()).collect();
+        let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m)| *m).collect();
         sqlx::query(
-            "INSERT INTO user_guilds (discord_id, guild_id, guild_name, updated_at) \
-             SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), now()",
+            "INSERT INTO user_guilds (discord_id, guild_id, guild_name, manage_guild, updated_at) \
+             SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::bool[]), now()",
         )
         .bind(discord_id)
         .bind(&guild_ids)
         .bind(&guild_names)
+        .bind(&manage_flags)
         .execute(&mut *tx)
         .await?;
     }
