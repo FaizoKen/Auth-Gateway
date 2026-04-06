@@ -1,0 +1,52 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8090:8090"
+    environment:
+      DATABASE_URL: postgres://app:password@db:5432/auth_gateway
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET}
+      SESSION_SECRET: ${SESSION_SECRET}
+      BASE_URL: ${BASE_URL}
+      LISTEN_ADDR: "0.0.0.0:8090"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  db:
+    image: postgres:16-alpine
+    command: >
+      postgres
+      -c shared_buffers=32MB
+      -c work_mem=2MB
+      -c maintenance_work_mem=16MB
+      -c effective_cache_size=64MB
+      -c max_connections=15
+      -c wal_buffers=2MB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+    environment:
+      POSTGRES_DB: auth_gateway
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: '32m'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d auth_gateway"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+volumes:
+  pgdata:
