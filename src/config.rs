@@ -8,6 +8,11 @@ pub struct AppConfig {
     pub session_secret: String,
     pub base_url: String,
     pub listen_addr: String,
+    /// Shared secret for plugin → gateway server-to-server calls
+    /// (the `/auth/internal/*` endpoints). Plugins send this in the
+    /// `X-Internal-Key` header. Must match the `INTERNAL_API_KEY` env
+    /// var on every plugin that calls back into the gateway.
+    pub internal_api_key: String,
 }
 
 impl AppConfig {
@@ -21,6 +26,8 @@ impl AppConfig {
             session_secret: env::var("SESSION_SECRET").expect("SESSION_SECRET must be set"),
             base_url: env::var("BASE_URL").expect("BASE_URL must be set"),
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8090".to_string()),
+            internal_api_key: env::var("INTERNAL_API_KEY")
+                .expect("INTERNAL_API_KEY must be set"),
         }
     }
 

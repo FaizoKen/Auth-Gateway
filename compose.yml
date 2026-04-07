@@ -10,6 +10,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET}
       BASE_URL: ${BASE_URL}
       LISTEN_ADDR: "0.0.0.0:8090"
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
     depends_on:
       db:
         condition: service_healthy
