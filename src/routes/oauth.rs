@@ -113,10 +113,11 @@ pub async fn callback(
             let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _)| name.as_str()).collect();
             let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m)| *m).collect();
             sqlx::query(
-                "INSERT INTO user_guilds (discord_id, guild_id, guild_name, manage_guild, updated_at) \
-                 SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::bool[]), now()",
+                "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, updated_at) \
+                 SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), now()",
             )
             .bind(&discord_id)
+            .bind(&display_name)
             .bind(&guild_ids)
             .bind(&guild_names)
             .bind(&manage_flags)
@@ -250,9 +251,9 @@ pub async fn guild_members(
         return Err(AppError::Unauthorized);
     }
 
-    // Fetch all member discord_ids and the guild name (any non-null is fine).
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT discord_id FROM user_guilds WHERE guild_id = $1",
+    // Fetch all member discord_ids (with usernames) and the guild name.
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT discord_id, discord_username FROM user_guilds WHERE guild_id = $1",
     )
     .bind(&query.guild_id)
     .fetch_all(&state.pool)
@@ -266,11 +267,16 @@ pub async fn guild_members(
     .fetch_optional(&state.pool)
     .await?;
 
-    let discord_ids: Vec<String> = rows.into_iter().map(|(id,)| id).collect();
+    let discord_ids: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
+    let usernames: serde_json::Map<String, serde_json::Value> = rows
+        .iter()
+        .filter_map(|(id, name)| name.as_ref().map(|n| (id.clone(), serde_json::Value::String(n.clone()))))
+        .collect();
     let name = guild_name.and_then(|(n,)| n);
 
     Ok(axum::Json(serde_json::json!({
         "discord_ids": discord_ids,
+        "usernames": usernames,
         "guild_name": name,
     })))
 }

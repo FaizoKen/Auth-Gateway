@@ -90,8 +90,9 @@ async fn refresh_user_guilds(
         .execute(&state.pool)
         .await?;
 
-    // Fetch guild list
+    // Fetch guild list and current display name
     let guilds = oauth.get_user_guilds(&access_token).await?;
+    let (_id, display_name) = oauth.get_user(&access_token).await?;
 
     // Replace guild memberships atomically
     let mut tx = state.pool.begin().await?;
@@ -105,10 +106,11 @@ async fn refresh_user_guilds(
         let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _)| name.as_str()).collect();
         let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m)| *m).collect();
         sqlx::query(
-            "INSERT INTO user_guilds (discord_id, guild_id, guild_name, manage_guild, updated_at) \
-             SELECT $1, UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::bool[]), now()",
+            "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, updated_at) \
+             SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), now()",
         )
         .bind(discord_id)
+        .bind(&display_name)
         .bind(&guild_ids)
         .bind(&guild_names)
         .bind(&manage_flags)
