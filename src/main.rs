@@ -59,6 +59,7 @@ async fn main() {
             .route("/logout", post(routes::oauth::logout))
             .route("/guild_permission", get(routes::oauth::guild_permission))
             .route("/guild_members", get(routes::oauth::guild_members))
+            .route("/my_guilds", get(routes::oauth::my_guilds))
             .route("/internal/user_guild_ids", get(routes::internal::user_guild_ids))
             .route("/internal/guild_member_ids", get(routes::internal::guild_member_ids))
             .route("/health", get(routes::health::health))

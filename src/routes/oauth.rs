@@ -275,6 +275,42 @@ pub async fn guild_members(
     })))
 }
 
+/// GET /auth/my_guilds
+///
+/// Returns the list of guilds the caller (authenticated via the shared
+/// `rl_session` cookie) is a member of, including each guild's display name
+/// and whether the caller has MANAGE_GUILD permission. Used by plugin admin
+/// pages that need to show a guild picker (e.g. game registration scoping).
+pub async fn my_guilds(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    let cookie = jar.get(SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
+    let (discord_id, _) = session::verify_session(cookie.value(), &state.config.session_secret)
+        .ok_or(AppError::Unauthorized)?;
+
+    let rows: Vec<(String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT guild_id, guild_name, manage_guild FROM user_guilds \
+         WHERE discord_id = $1 ORDER BY guild_name NULLS LAST, guild_id",
+    )
+    .bind(&discord_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let guilds: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, name, manage)| {
+            serde_json::json!({
+                "guild_id": id,
+                "guild_name": name,
+                "manage_guild": manage,
+            })
+        })
+        .collect();
+
+    Ok(axum::Json(serde_json::json!({ "guilds": guilds })))
+}
+
 /// POST /auth/logout
 #[derive(serde::Deserialize)]
 pub struct LogoutQuery {
