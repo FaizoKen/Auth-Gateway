@@ -135,7 +135,9 @@ pub async fn callback(
         }
     }
 
-    // Set session cookie
+    // Set session cookie. The cookie's max_age must mirror the signed payload's
+    // expiry, otherwise the browser silently evicts the cookie before the HMAC
+    // says it should be invalid — that's the bug that forced re-OAuth every hour.
     let session_value =
         session::sign_session(&discord_id, &display_name, &state.config.session_secret);
 
@@ -143,7 +145,7 @@ pub async fn callback(
         .path("/")
         .http_only(true)
         .same_site(axum_extra::extract::cookie::SameSite::Lax)
-        .max_age(time::Duration::hours(1));
+        .max_age(time::Duration::seconds(session::SESSION_TTL_SECS));
 
     let jar = jar.add(cookie);
 
