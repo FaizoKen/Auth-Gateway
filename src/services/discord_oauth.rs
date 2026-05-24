@@ -18,6 +18,10 @@ struct DiscordUser {
 struct DiscordGuild {
     id: String,
     name: String,
+    // Discord guild icon hash. `null` when the server has no custom
+    // icon — we fall back to a letter avatar client-side in that case.
+    #[serde(default)]
+    icon: Option<String>,
     // Discord returns permissions as a string-encoded u64 bitflag.
     #[serde(default)]
     permissions: String,
@@ -34,14 +38,26 @@ impl DiscordOAuth {
         Self { http }
     }
 
-    pub fn authorize_url(config: &AppConfig, state: &str) -> String {
+    /// Build the Discord authorize URL.
+    ///
+    /// When `silent` is true, `prompt=none` is appended: Discord skips the
+    /// consent screen and redirects straight back **iff** the user has already
+    /// authorized this client with at least the requested scopes. Otherwise it
+    /// redirects back with an `error` (e.g. `consent_required` /
+    /// `login_required`), which the callback handles by retrying without
+    /// `prompt=none`.
+    pub fn authorize_url(config: &AppConfig, state: &str, silent: bool) -> String {
         let redirect_uri = config.oauth_redirect_uri();
-        format!(
+        let mut url = format!(
             "https://discord.com/oauth2/authorize?client_id={}&redirect_uri={}&response_type=code&scope=identify%20guilds&state={}",
             config.discord_client_id,
             urlencoding::encode(&redirect_uri),
             state
-        )
+        );
+        if silent {
+            url.push_str("&prompt=none");
+        }
+        url
     }
 
     pub async fn exchange_code(
@@ -113,12 +129,13 @@ impl DiscordOAuth {
         Ok((user.id, display_name))
     }
 
-    /// Returns `(guild_id, guild_name, manage_guild)` for each guild the user belongs to.
+    /// Returns `(guild_id, guild_name, manage_guild, icon_hash)` for each guild the user belongs to.
     /// `manage_guild` is true if the user is the guild owner or has the MANAGE_GUILD permission bit.
+    /// `icon_hash` is `None` when the server has no custom icon.
     pub async fn get_user_guilds(
         &self,
         access_token: &str,
-    ) -> Result<Vec<(String, String, bool)>, AppError> {
+    ) -> Result<Vec<(String, String, bool, Option<String>)>, AppError> {
         let guilds: Vec<DiscordGuild> = self
             .http
             .get("https://discord.com/api/v10/users/@me/guilds")
@@ -137,7 +154,7 @@ impl DiscordOAuth {
             .map(|g| {
                 let perms = g.permissions.parse::<u64>().unwrap_or(0);
                 let manage = g.owner || (perms & MANAGE_GUILD) != 0;
-                (g.id, g.name, manage)
+                (g.id, g.name, manage, g.icon)
             })
             .collect())
     }

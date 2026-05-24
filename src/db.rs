@@ -27,4 +27,34 @@ pub async fn run_migrations(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to run migration 003");
+
+    sqlx::raw_sql(include_str!("../migrations/004_oauth_states_silent.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 004");
+
+    sqlx::raw_sql(include_str!("../migrations/005_user_guild_optouts.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 005");
+
+    sqlx::raw_sql(include_str!("../migrations/006_user_settings.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 006");
+
+    sqlx::raw_sql(include_str!("../migrations/007_user_guilds_icon.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 007");
+
+    sqlx::raw_sql(include_str!("../migrations/008_auto_enable_default_false.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 008");
+
+    sqlx::raw_sql(include_str!("../migrations/009_cleanup_removed_plugins.sql"))
+        .execute(pool)
+        .await
+        .expect("Failed to run migration 009");
 }

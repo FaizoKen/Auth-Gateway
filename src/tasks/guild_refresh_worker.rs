@@ -96,25 +96,43 @@ async fn refresh_user_guilds(
 
     // Replace guild memberships atomically
     let mut tx = state.pool.begin().await?;
+
+    // Snapshot the previous guild set so the optout helper can detect
+    // brand-new guilds and honor the user's "auto-enable new servers"
+    // preference. Done inside the same tx as the wipe/insert.
+    let old_guild_ids =
+        crate::services::optout::snapshot_guild_ids(&mut tx, discord_id).await?;
+
     sqlx::query("DELETE FROM user_guilds WHERE discord_id = $1")
         .bind(discord_id)
         .execute(&mut *tx)
         .await?;
 
     if !guilds.is_empty() {
-        let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _)| id.as_str()).collect();
-        let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _)| name.as_str()).collect();
-        let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m)| *m).collect();
+        let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _, _)| id.as_str()).collect();
+        let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _, _)| name.as_str()).collect();
+        let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m, _)| *m).collect();
+        let icon_hashes: Vec<Option<String>> =
+            guilds.iter().map(|(_, _, _, icon)| icon.clone()).collect();
         sqlx::query(
-            "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, updated_at) \
-             SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), now()",
+            "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, icon_hash, updated_at) \
+             SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), UNNEST($6::text[]), now()",
         )
         .bind(discord_id)
         .bind(&display_name)
         .bind(&guild_ids)
         .bind(&guild_names)
         .bind(&manage_flags)
+        .bind(&icon_hashes)
         .execute(&mut *tx)
+        .await?;
+
+        crate::services::optout::apply_optouts_for_new_guilds(
+            &mut tx,
+            discord_id,
+            &old_guild_ids,
+            &guild_ids,
+        )
         .await?;
     }
 

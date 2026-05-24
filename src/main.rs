@@ -1,14 +1,33 @@
 use std::sync::Arc;
 
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+/// Embed the favicon at compile-time so it ships in the binary — no
+/// runtime file IO, no static-file server, no missing-asset risk in
+/// production. Cached aggressively (1 day) since the bytes are pinned
+/// to whatever build is currently running.
+const FAVICON_BYTES: &[u8] = include_bytes!("../favicon.ico");
+
+async fn favicon() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/x-icon"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_BYTES,
+    )
+}
+
 mod config;
 mod db;
 mod error;
+mod plugins;
 mod routes;
 mod services;
 mod tasks;
@@ -54,12 +73,18 @@ async fn main() {
 
     let app = Router::new()
         .nest("/auth", Router::new()
+            .route("/favicon.ico", get(favicon))
             .route("/login", get(routes::oauth::login))
             .route("/callback", get(routes::oauth::callback))
             .route("/logout", post(routes::oauth::logout))
             .route("/guild_permission", get(routes::oauth::guild_permission))
             .route("/guild_members", get(routes::oauth::guild_members))
             .route("/my_guilds", get(routes::oauth::my_guilds))
+            .route("/my_servers", get(routes::preferences::my_servers_page))
+            .route("/preferences", get(routes::preferences::get_preferences)
+                                     .post(routes::preferences::update_preference))
+            .route("/preferences/bulk", post(routes::preferences::bulk_update_preference))
+            .route("/preferences/auto_enable", post(routes::preferences::update_auto_enable))
             .route("/internal/user_guild_ids", get(routes::internal::user_guild_ids))
             .route("/internal/guild_member_ids", get(routes::internal::guild_member_ids))
             .route("/health", get(routes::health::health))

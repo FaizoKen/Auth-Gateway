@@ -1,3 +1,4 @@
 pub mod health;
 pub mod internal;
 pub mod oauth;
+pub mod preferences;

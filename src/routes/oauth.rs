@@ -4,7 +4,9 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use rand::Rng;
+use sqlx::PgPool;
 
+use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::services::discord_oauth::DiscordOAuth;
 use crate::services::session;
@@ -24,6 +26,39 @@ pub struct CallbackQuery {
     pub error: Option<String>,
 }
 
+/// Create a fresh CSRF state row and return the Discord authorize URL.
+///
+/// `silent = true` requests `prompt=none` so returning users who already
+/// authorized this client skip the consent screen. If Discord refuses the
+/// silent attempt, `callback` retries via this same helper with
+/// `silent = false`. `return_to` must already be a validated relative path.
+async fn begin_oauth(
+    pool: &PgPool,
+    config: &AppConfig,
+    return_to: &str,
+    silent: bool,
+) -> Result<String, AppError> {
+    let state_param: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
+    let expires = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+    sqlx::query(
+        "INSERT INTO oauth_states (state, return_to, expires_at, silent) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&state_param)
+    .bind(return_to)
+    .bind(expires)
+    .bind(silent)
+    .execute(pool)
+    .await?;
+
+    Ok(DiscordOAuth::authorize_url(config, &state_param, silent))
+}
+
 /// GET /auth/login?return_to=/genshin-player-role/verify
 pub async fn login(
     State(state): State<Arc<AppState>>,
@@ -38,24 +73,10 @@ pub async fn login(
         ));
     }
 
-    let state_param: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
-
-    let expires = chrono::Utc::now() + chrono::Duration::minutes(10);
-
-    sqlx::query(
-        "INSERT INTO oauth_states (state, return_to, expires_at) VALUES ($1, $2, $3)",
-    )
-    .bind(&state_param)
-    .bind(&return_to)
-    .bind(expires)
-    .execute(&state.pool)
-    .await?;
-
-    let url = DiscordOAuth::authorize_url(&state.config, &state_param);
+    // Start silent: a returning user who already granted these scopes is
+    // bounced straight back with a code and never sees the consent screen.
+    // First-time users / changed scopes get the real screen via `callback`.
+    let url = begin_oauth(&state.pool, &state.config, &return_to, true).await?;
     Ok(Redirect::temporary(&url).into_response())
 }
 
@@ -65,9 +86,31 @@ pub async fn callback(
     jar: CookieJar,
     Query(query): Query<CallbackQuery>,
 ) -> Result<(CookieJar, Redirect), AppError> {
-    // Handle user denial
+    // Discord came back with an error (or no code). Under `prompt=none` this
+    // is the *expected* path for users who haven't consented yet (error is
+    // typically `consent_required` / `login_required`), so retry once with
+    // the real consent screen. A failure on the non-silent attempt is a
+    // genuine denial — stop there so we can't loop.
     if query.error.is_some() || query.code.is_none() {
-        return Ok((jar, Redirect::to("/")));
+        let prior = sqlx::query_as::<_, (String, bool)>(
+            "DELETE FROM oauth_states WHERE state = $1 RETURNING return_to, silent",
+        )
+        .bind(&query.state)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        return match prior {
+            // Silent attempt refused -> fall back to the real consent screen.
+            Some((return_to, true)) => {
+                let url =
+                    begin_oauth(&state.pool, &state.config, &return_to, false).await?;
+                Ok((jar, Redirect::to(&url)))
+            }
+            // Consent screen itself declined -> genuine denial, no retry.
+            Some((return_to, false)) => Ok((jar, Redirect::to(&return_to))),
+            // Unknown / expired / forged state -> safe default.
+            None => Ok((jar, Redirect::to("/"))),
+        };
     }
     let code = query.code.unwrap();
 
@@ -104,24 +147,42 @@ pub async fn callback(
     match oauth.get_user_guilds(&access_token).await {
         Ok(guilds) if !guilds.is_empty() => {
             let mut tx = state.pool.begin().await?;
+
+            // Snapshot the user's previous guild set BEFORE the wipe — the
+            // optout helper uses this to detect "brand new" guilds and
+            // apply the per-user "auto-enable new servers" preference.
+            let old_guild_ids =
+                crate::services::optout::snapshot_guild_ids(&mut tx, &discord_id).await?;
+
             sqlx::query("DELETE FROM user_guilds WHERE discord_id = $1")
                 .bind(&discord_id)
                 .execute(&mut *tx)
                 .await?;
 
-            let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _)| id.as_str()).collect();
-            let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _)| name.as_str()).collect();
-            let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m)| *m).collect();
+            let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _, _)| id.as_str()).collect();
+            let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _, _)| name.as_str()).collect();
+            let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m, _)| *m).collect();
+            let icon_hashes: Vec<Option<String>> =
+                guilds.iter().map(|(_, _, _, icon)| icon.clone()).collect();
             sqlx::query(
-                "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, updated_at) \
-                 SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), now()",
+                "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, icon_hash, updated_at) \
+                 SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), UNNEST($6::text[]), now()",
             )
             .bind(&discord_id)
             .bind(&display_name)
             .bind(&guild_ids)
             .bind(&guild_names)
             .bind(&manage_flags)
+            .bind(&icon_hashes)
             .execute(&mut *tx)
+            .await?;
+
+            crate::services::optout::apply_optouts_for_new_guilds(
+                &mut tx,
+                &discord_id,
+                &old_guild_ids,
+                &guild_ids,
+            )
             .await?;
 
             tx.commit().await?;
@@ -156,6 +217,13 @@ pub async fn callback(
 #[derive(serde::Deserialize)]
 pub struct GuildPermissionQuery {
     pub guild_id: String,
+    /// Optional plugin slug. Honored by `/auth/guild_members` only —
+    /// when supplied, members who opted out of this plugin (or guild-wide)
+    /// are stripped from the returned list, so they disappear from the
+    /// plugin's public player-list pages too. `/auth/guild_permission`
+    /// ignores it because opt-outs are about role assignment, not
+    /// guild membership.
+    pub plugin: Option<String>,
 }
 
 /// GET /auth/guild_permission?guild_id=...
@@ -254,10 +322,23 @@ pub async fn guild_members(
     }
 
     // Fetch all member discord_ids (with usernames) and the guild name.
+    //
+    // When `plugin` is supplied (player-list pages do this so opted-out
+    // users disappear from public listings too), anti-join against
+    // `user_guild_optouts` for that plugin or the guild-wide master row.
+    let plugin = query.plugin.clone().unwrap_or_default();
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT discord_id, discord_username FROM user_guilds WHERE guild_id = $1",
+        "SELECT ug.discord_id, ug.discord_username FROM user_guilds ug \
+         WHERE ug.guild_id = $1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM user_guild_optouts o \
+             WHERE o.discord_id = ug.discord_id \
+               AND o.guild_id   = ug.guild_id \
+               AND o.plugin IN ('', $2) \
+           )",
     )
     .bind(&query.guild_id)
+    .bind(&plugin)
     .fetch_all(&state.pool)
     .await?;
 

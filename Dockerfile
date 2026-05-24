@@ -10,6 +10,7 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs && \
 # Build actual source
 COPY src/ src/
 COPY migrations/ migrations/
+COPY favicon.ico ./
 RUN cargo build --release && strip target/release/auth-gateway
 
 FROM debian:bookworm-slim

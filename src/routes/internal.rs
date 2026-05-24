@@ -46,16 +46,24 @@ fn verify_internal_key(headers: &HeaderMap, expected: &str) -> Result<(), AppErr
 #[derive(serde::Deserialize)]
 pub struct UserGuildIdsQuery {
     pub discord_id: String,
+    /// Plugin slug requesting the data. When present, guilds the user has
+    /// explicitly opted out of (either for this plugin or guild-wide) are
+    /// filtered out. Absent for legacy callers — they get the unfiltered
+    /// list (master opt-out still applies for consistency).
+    pub plugin: Option<String>,
 }
 
-/// GET /auth/internal/user_guild_ids?discord_id=...
+/// GET /auth/internal/user_guild_ids?discord_id=...[&plugin=<slug>]
 ///
 /// Returns the list of guild IDs the given user is a member of, according
 /// to the gateway's `user_guilds` table (which is the source of truth,
 /// kept fresh by the OAuth callback and the guild_refresh_worker).
 ///
-/// Used by plugin sync workers to scope role syncs to the user's actual
-/// guild membership without having to keep their own `user_guilds` mirror.
+/// When `plugin` is provided, any guild the user has opted out of — either
+/// for that specific plugin or via the guild-wide master toggle — is
+/// excluded. Absence of an opt-out row means opted-in, which preserves
+/// the pre-existing behavior for users who have never touched their
+/// preferences.
 pub async fn user_guild_ids(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -63,10 +71,22 @@ pub async fn user_guild_ids(
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     verify_internal_key(&headers, &state.config.internal_api_key)?;
 
+    // Anti-join against the opt-out table: the empty plugin slug stands
+    // for the guild-wide master toggle, and a row keyed on the caller's
+    // plugin slug is the per-plugin override. Either disables the guild.
+    let plugin = query.plugin.unwrap_or_default();
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT guild_id FROM user_guilds WHERE discord_id = $1",
+        "SELECT ug.guild_id FROM user_guilds ug \
+         WHERE ug.discord_id = $1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM user_guild_optouts o \
+             WHERE o.discord_id = ug.discord_id \
+               AND o.guild_id   = ug.guild_id \
+               AND o.plugin IN ('', $2) \
+           )",
     )
     .bind(&query.discord_id)
+    .bind(&plugin)
     .fetch_all(&state.pool)
     .await?;
 
@@ -80,13 +100,22 @@ pub async fn user_guild_ids(
 #[derive(serde::Deserialize)]
 pub struct GuildMemberIdsQuery {
     pub guild_id: String,
+    /// Plugin slug requesting the data. When present, members who have
+    /// opted out of this guild (either plugin-specific or guild-wide)
+    /// are filtered out.
+    pub plugin: Option<String>,
 }
 
-/// GET /auth/internal/guild_member_ids?guild_id=...
+/// GET /auth/internal/guild_member_ids?guild_id=...[&plugin=<slug>]
 ///
 /// Returns every Discord ID the gateway knows to be a member of the given
 /// guild, plus the cached guild name. Used by plugin sync workers to filter
 /// their local `linked_accounts` query down to "users in this guild".
+///
+/// When `plugin` is provided, members who have opted out of this guild
+/// for the calling plugin (or guild-wide) are excluded from the returned
+/// list so the plugin's atomic role replacement strips their role on the
+/// next sync.
 pub async fn guild_member_ids(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -94,10 +123,19 @@ pub async fn guild_member_ids(
 ) -> Result<axum::Json<serde_json::Value>, AppError> {
     verify_internal_key(&headers, &state.config.internal_api_key)?;
 
+    let plugin = query.plugin.unwrap_or_default();
     let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT discord_id FROM user_guilds WHERE guild_id = $1",
+        "SELECT ug.discord_id FROM user_guilds ug \
+         WHERE ug.guild_id = $1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM user_guild_optouts o \
+             WHERE o.discord_id = ug.discord_id \
+               AND o.guild_id   = ug.guild_id \
+               AND o.plugin IN ('', $2) \
+           )",
     )
     .bind(&query.guild_id)
+    .bind(&plugin)
     .fetch_all(&state.pool)
     .await?;
 
