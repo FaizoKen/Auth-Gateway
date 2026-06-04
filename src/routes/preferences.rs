@@ -27,16 +27,37 @@ use serde_json::{json, Value};
 
 use crate::error::AppError;
 use crate::plugins::{is_known_plugin, PLUGINS};
-use crate::services::{optout, session};
+use crate::services::{guild_sync, optout, session};
 use crate::AppState;
 
 const SESSION_COOKIE: &str = "rl_session";
+
+/// Minimum seconds between on-demand guild refreshes for a single user.
+/// Short enough that "join the server, reload the page" succeeds within a
+/// few seconds; long enough that a reload loop can't hammer Discord.
+const ENSURE_GUILD_COOLDOWN_SECS: f64 = 5.0;
 
 fn caller_discord_id(jar: &CookieJar, secret: &str) -> Result<String, AppError> {
     let cookie = jar.get(SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
     let (discord_id, _) = session::verify_session(cookie.value(), secret)
         .ok_or(AppError::Unauthorized)?;
     Ok(discord_id)
+}
+
+/// A Discord snowflake: 5–25 ASCII digits. Mirrors the client-side
+/// `/^[0-9]{5,25}$/` guard so we never spend a Discord refresh on junk.
+fn is_snowflake(s: &str) -> bool {
+    (5..=25).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+#[derive(Deserialize)]
+pub struct PreferencesQuery {
+    /// Set by verify pages reached via a per-guild link (`?guild=<id>`).
+    /// When this guild isn't in our cached `user_guilds` for the caller,
+    /// we re-query Discord once (cooldown-gated) before answering — so a
+    /// user who just joined the server is recognized immediately instead
+    /// of waiting for their next login or the 7-day refresh sweep.
+    pub ensure_guild: Option<String>,
 }
 
 /// GET /auth/preferences
@@ -46,8 +67,39 @@ fn caller_discord_id(jar: &CookieJar, secret: &str) -> Result<String, AppError> 
 pub async fn get_preferences(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
+    Query(q): Query<PreferencesQuery>,
 ) -> Result<Json<Value>, AppError> {
     let discord_id = caller_discord_id(&jar, &state.config.session_secret)?;
+
+    // On-demand guild refresh. The cached guild list only updates on login
+    // or via the 7-day worker, so a freshly-joined server is invisible
+    // until then. When a verify page asks about a specific guild we don't
+    // have on file, re-query Discord once before building the response.
+    if let Some(gid) = q.ensure_guild.as_deref().filter(|g| is_snowflake(g)) {
+        let known: Option<(String,)> = sqlx::query_as(
+            "SELECT guild_id FROM user_guilds WHERE discord_id = $1 AND guild_id = $2",
+        )
+        .bind(&discord_id)
+        .bind(gid)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        if known.is_none() {
+            // Best-effort: if Discord is down or the token's gone, fall
+            // through and answer with the cache we have.
+            match guild_sync::refresh_on_demand(&state, &discord_id, ENSURE_GUILD_COOLDOWN_SECS)
+                .await
+            {
+                Ok(guild_sync::OnDemand::Refreshed(n)) => {
+                    tracing::info!(discord_id, guild_id = gid, guilds = n, "ensure_guild refreshed");
+                }
+                Ok(guild_sync::OnDemand::Skipped) => {}
+                Err(e) => {
+                    tracing::warn!(discord_id, guild_id = gid, "ensure_guild refresh failed: {e}");
+                }
+            }
+        }
+    }
 
     let guild_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT guild_id, guild_name, icon_hash FROM user_guilds \
