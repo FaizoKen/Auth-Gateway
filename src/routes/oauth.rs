@@ -185,6 +185,16 @@ pub async fn callback(
             )
             .await?;
 
+            // Login just refreshed the cache, so record that — otherwise
+            // guilds_refreshed_at keeps its stale value (the token upsert
+            // above doesn't touch it), which would trigger a redundant
+            // on-demand refresh on the next My Servers visit and let the
+            // 7-day worker re-sweep a user whose cache is actually fresh.
+            sqlx::query("UPDATE discord_tokens SET guilds_refreshed_at = now() WHERE discord_id = $1")
+                .bind(&discord_id)
+                .execute(&mut *tx)
+                .await?;
+
             tx.commit().await?;
             tracing::info!(discord_id, guilds = guilds.len(), "Stored guild memberships");
         }

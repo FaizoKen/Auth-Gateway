@@ -37,6 +37,13 @@ const SESSION_COOKIE: &str = "rl_session";
 /// few seconds; long enough that a reload loop can't hammer Discord.
 const ENSURE_GUILD_COOLDOWN_SECS: f64 = 5.0;
 
+/// Minimum seconds between forced full guild re-syncs triggered by a
+/// My Servers page load (`?refresh=1`). Slightly longer than the targeted
+/// `ensure_guild` window because this fires on *every* visit, not just a
+/// cache miss — a modest gate keeps reloads off Discord while any normal
+/// page open still picks up servers the user joined or left.
+const MY_SERVERS_REFRESH_COOLDOWN_SECS: f64 = 15.0;
+
 fn caller_discord_id(jar: &CookieJar, secret: &str) -> Result<String, AppError> {
     let cookie = jar.get(SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
     let (discord_id, _) = session::verify_session(cookie.value(), secret)
@@ -58,6 +65,13 @@ pub struct PreferencesQuery {
     /// user who just joined the server is recognized immediately instead
     /// of waiting for their next login or the 7-day refresh sweep.
     pub ensure_guild: Option<String>,
+    /// Set to `1` by the My Servers page on its initial load to force a
+    /// cooldown-gated *full* re-sync of the caller's guild list from
+    /// Discord. Unlike `ensure_guild` (which only ever *adds* a single
+    /// named guild on a cache miss), this replaces `user_guilds`
+    /// wholesale, so servers the user joined AND left since their last
+    /// login are both reflected. Presence of the param is what matters.
+    pub refresh: Option<String>,
 }
 
 /// GET /auth/preferences
@@ -71,11 +85,32 @@ pub async fn get_preferences(
 ) -> Result<Json<Value>, AppError> {
     let discord_id = caller_discord_id(&jar, &state.config.session_secret)?;
 
+    // My Servers page load (`?refresh=1`): force a cooldown-gated FULL
+    // re-sync. The cached guild list otherwise only updates on login or
+    // via the 7-day worker, so the page would show a stale list — servers
+    // joined since last login missing, servers left still present.
+    // refresh_on_demand replaces user_guilds wholesale, so a single call
+    // surfaces additions AND removals. The cooldown keeps reload storms
+    // off Discord; a best-effort failure just answers from cache.
+    if q.refresh.is_some() {
+        match guild_sync::refresh_on_demand(&state, &discord_id, MY_SERVERS_REFRESH_COOLDOWN_SECS)
+            .await
+        {
+            Ok(guild_sync::OnDemand::Refreshed(n)) => {
+                tracing::info!(discord_id, guilds = n, "my_servers full guild refresh");
+            }
+            Ok(guild_sync::OnDemand::Skipped) => {}
+            Err(e) => {
+                tracing::warn!(discord_id, "my_servers guild refresh failed: {e}");
+            }
+        }
+    }
     // On-demand guild refresh. The cached guild list only updates on login
     // or via the 7-day worker, so a freshly-joined server is invisible
     // until then. When a verify page asks about a specific guild we don't
     // have on file, re-query Discord once before building the response.
-    if let Some(gid) = q.ensure_guild.as_deref().filter(|g| is_snowflake(g)) {
+    // (Skipped when `refresh=1` already did a full re-sync above.)
+    else if let Some(gid) = q.ensure_guild.as_deref().filter(|g| is_snowflake(g)) {
         let known: Option<(String,)> = sqlx::query_as(
             "SELECT guild_id FROM user_guilds WHERE discord_id = $1 AND guild_id = $2",
         )
@@ -1278,7 +1313,11 @@ fn render_my_servers_html(back_href: &str) -> String {
         // ------- Initial load -------
         async function load() {{
             try {{
-                const data = await api('GET', '/auth/preferences');
+                // `refresh=1` forces a cooldown-gated full re-sync of the
+                // guild list from Discord, so servers joined or left since
+                // last login show up / disappear instead of a stale cache.
+                // The skeleton above covers the extra round-trip latency.
+                const data = await api('GET', '/auth/preferences?refresh=1');
                 state.guilds = data.guilds || [];
                 state.plugins = data.plugins || [];
 
