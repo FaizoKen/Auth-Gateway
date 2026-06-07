@@ -27,6 +27,7 @@ pub const PLUGINS: &[PluginEntry] = &[
     PluginEntry { slug: "referral-code-role",       display_name: "Referral Code Role" },
     PluginEntry { slug: "roblox-player-role",       display_name: "Roblox Player Role" },
     PluginEntry { slug: "steam-player-role",        display_name: "Steam Player Role" },
+    PluginEntry { slug: "stripe-subscriber-role",   display_name: "Stripe Subscriber Role" },
     PluginEntry { slug: "tiktok-creator-role",      display_name: "TikTok Creator Role" },
     PluginEntry { slug: "twitch-follower-role",     display_name: "Twitch Follower Role" },
     PluginEntry { slug: "youtube-subscriber-role",  display_name: "YouTube Subscriber Role" },
