@@ -87,6 +87,7 @@ async fn main() {
             .route("/preferences/auto_enable", post(routes::preferences::update_auto_enable))
             .route("/internal/user_guild_ids", get(routes::internal::user_guild_ids))
             .route("/internal/guild_member_ids", get(routes::internal::guild_member_ids))
+            .route("/internal/guild_optout_ids", get(routes::internal::guild_optout_ids))
             .route("/health", get(routes::health::health))
         )
         .layer(TraceLayer::new_for_http())

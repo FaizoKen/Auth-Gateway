@@ -155,3 +155,46 @@ pub async fn guild_member_ids(
         "guild_name": name,
     })))
 }
+
+#[derive(serde::Deserialize)]
+pub struct GuildOptoutIdsQuery {
+    pub guild_id: String,
+    /// Plugin slug. A member is "opted out" of this guild when they hold a
+    /// guild-wide master opt-out (empty slug) OR a `plugin=<slug>` override.
+    pub plugin: Option<String>,
+}
+
+/// GET /auth/internal/guild_optout_ids?guild_id=...[&plugin=<slug>]
+///
+/// Returns the Discord IDs that have opted OUT of the given guild — via the
+/// guild-wide master toggle (empty plugin slug) or a `plugin=<slug>` override.
+///
+/// This is the *complement* of the filter [`guild_member_ids`] applies. A
+/// plugin that builds its candidate set from its own linked data (e.g. paying
+/// subscribers) rather than the gateway's member list calls this to subtract
+/// opted-out users, so the centralized opt-out system is still honored even
+/// for members the gateway has never seen log in. Authenticated by the shared
+/// `INTERNAL_API_KEY` like the other `/auth/internal/*` endpoints.
+pub async fn guild_optout_ids(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<GuildOptoutIdsQuery>,
+) -> Result<axum::Json<serde_json::Value>, AppError> {
+    verify_internal_key(&headers, &state.config.internal_api_key)?;
+
+    let plugin = query.plugin.unwrap_or_default();
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT o.discord_id FROM user_guild_optouts o \
+         WHERE o.guild_id = $1 AND o.plugin IN ('', $2)",
+    )
+    .bind(&query.guild_id)
+    .bind(&plugin)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let discord_ids: Vec<String> = rows.into_iter().map(|(id,)| id).collect();
+
+    Ok(axum::Json(serde_json::json!({
+        "discord_ids": discord_ids,
+    })))
+}
