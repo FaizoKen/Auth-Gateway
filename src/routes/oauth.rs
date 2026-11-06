@@ -220,20 +220,20 @@ pub async fn guild_permission(
     })?;
 
     let cookie_value = cookie.value();
-    let cookie_len = cookie_value.len();
-    let cookie_fp = if cookie_len >= 12 {
-        format!("{}…{}", &cookie_value[..6], &cookie_value[cookie_len - 6..])
-    } else {
-        "<short>".to_string()
-    };
 
     let (discord_id, _) = session::verify_session(cookie_value, &state.config.session_secret)
         .ok_or_else(|| {
+            // Never log the cookie, or any slice of it: it is a bearer
+            // credential, and one that failed only because it was re-encoded
+            // in transit is a decode away from a working session. Its shape
+            // tells the usual causes apart, and the hash lets repeats from one
+            // browser be matched up without revealing anything.
             tracing::warn!(
                 guild_id = %query.guild_id,
-                cookie_len,
-                cookie_fp = %cookie_fp,
-                cookie_value = %cookie_value,
+                cookie_len = cookie_value.len(),
+                cookie_parts = cookie_value.split(':').count(),
+                cookie_has_percent = cookie_value.contains('%'),
+                cookie_fp = %cookie_fingerprint(cookie_value),
                 "guild_permission: rl_session cookie present but verify_session FAILED \
                  — signature mismatch (probably the cookie value was mutated in transit, \
                  e.g. percent-decoded — or SESSION_SECRET differs from the issuer)"
@@ -401,4 +401,39 @@ pub async fn logout(
         .unwrap_or_else(|| "/".to_string());
 
     (jar.remove(cookie), Redirect::to(&target))
+}
+
+/// A short, one-way tag for a cookie in log lines: the first 12 hex digits
+/// of its SHA-256. Enough to see that two failures came from the same
+/// browser; nothing of the cookie itself can be read back from it. Works on
+/// any input — a byte-offset slice panicked on a multi-byte character.
+fn cookie_fingerprint(cookie_value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(cookie_value.as_bytes());
+    hex::encode(&digest[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cookie_fingerprint;
+
+    #[test]
+    fn fingerprint_reveals_nothing_of_the_cookie() {
+        let cookie = "123456789012345678:Some%20Name:1999999999:deadbeefcafebabe";
+        let fp = cookie_fingerprint(cookie);
+        assert_eq!(fp.len(), 12);
+        assert!(!fp.contains("123456"));
+        assert!(!fp.contains("babe"));
+        // Stable, so repeats from one browser line up.
+        assert_eq!(fp, cookie_fingerprint(cookie));
+        assert_ne!(fp, cookie_fingerprint("123456789012345678:Other:1:00"));
+    }
+
+    #[test]
+    fn fingerprint_takes_any_input() {
+        // The old 6-and-6 byte slice panicked on these.
+        for odd in ["", "a", "ééééééééééééé", "😀😀😀😀😀😀😀😀:x"] {
+            assert_eq!(cookie_fingerprint(odd).len(), 12);
+        }
+    }
 }
