@@ -143,65 +143,28 @@ pub async fn callback(
         .await?;
     }
 
-    // Fetch and store guild memberships
+    // Fetch and store guild memberships. An empty list is stored too: a
+    // user who has left every server must not keep the servers on file from
+    // before. `store_user_guilds` also records the refresh, so the next My
+    // Servers visit and the 7-day worker don't redo it.
     match oauth.get_user_guilds(&access_token).await {
-        Ok(guilds) if !guilds.is_empty() => {
-            let mut tx = state.pool.begin().await?;
-
-            // Snapshot the user's previous guild set BEFORE the wipe — the
-            // optout helper uses this to detect "brand new" guilds and
-            // apply the per-user "auto-enable new servers" preference.
-            let old_guild_ids =
-                crate::services::optout::snapshot_guild_ids(&mut tx, &discord_id).await?;
-
-            sqlx::query("DELETE FROM user_guilds WHERE discord_id = $1")
-                .bind(&discord_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let guild_ids: Vec<&str> = guilds.iter().map(|(id, _, _, _)| id.as_str()).collect();
-            let guild_names: Vec<&str> = guilds.iter().map(|(_, name, _, _)| name.as_str()).collect();
-            let manage_flags: Vec<bool> = guilds.iter().map(|(_, _, m, _)| *m).collect();
-            let icon_hashes: Vec<Option<String>> =
-                guilds.iter().map(|(_, _, _, icon)| icon.clone()).collect();
-            sqlx::query(
-                "INSERT INTO user_guilds (discord_id, discord_username, guild_id, guild_name, manage_guild, icon_hash, updated_at) \
-                 SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), UNNEST($6::text[]), now()",
-            )
-            .bind(&discord_id)
-            .bind(&display_name)
-            .bind(&guild_ids)
-            .bind(&guild_names)
-            .bind(&manage_flags)
-            .bind(&icon_hashes)
-            .execute(&mut *tx)
-            .await?;
-
-            crate::services::optout::apply_optouts_for_new_guilds(
-                &mut tx,
+        Ok(guilds) => {
+            crate::services::guild_sync::store_user_guilds(
+                &state,
                 &discord_id,
-                &old_guild_ids,
-                &guild_ids,
+                &display_name,
+                &guilds,
             )
             .await?;
-
-            // Login just refreshed the cache, so record that — otherwise
-            // guilds_refreshed_at keeps its stale value (the token upsert
-            // above doesn't touch it), which would trigger a redundant
-            // on-demand refresh on the next My Servers visit and let the
-            // 7-day worker re-sweep a user whose cache is actually fresh.
-            sqlx::query("UPDATE discord_tokens SET guilds_refreshed_at = now() WHERE discord_id = $1")
-                .bind(&discord_id)
-                .execute(&mut *tx)
-                .await?;
-
-            tx.commit().await?;
-            tracing::info!(discord_id, guilds = guilds.len(), "Stored guild memberships");
-        }
-        Ok(_) => {
-            tracing::debug!(discord_id, "User has no guilds");
+            tracing::info!(
+                discord_id,
+                guilds = guilds.len(),
+                "Stored guild memberships"
+            );
         }
         Err(e) => {
+            // Leave what we have; it ages out on its own if it can never be
+            // refreshed (see guild_sync::expire_unverifiable).
             tracing::warn!(discord_id, "Failed to fetch guilds: {e}");
         }
     }

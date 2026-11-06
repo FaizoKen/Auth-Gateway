@@ -17,6 +17,11 @@ This eliminates the need to register a separate Discord OAuth redirect URI per p
 
 The Auth Gateway runs a single `guild_refresh_worker` that periodically refreshes Discord guild memberships for all users. This replaces the duplicate guild refresh workers that previously ran inside each plugin.
 
+- Each user is refreshed about every 7 days, and on demand from My Servers and per-server verify links.
+- A refresh Discord doesn't answer usefully (no answer, a rate limit, a 5xx) keeps the user's token and is retried an hour later.
+- Only Discord's `invalid_grant` (the user de-authorized the app) forgets the token. A rejected client secret never does.
+- A guild list that can no longer be refreshed is removed 14 days after Discord last confirmed it, unless the user signs in again. Plugins then stop treating that user as a member of those servers.
+
 ## Setup
 
 ```bash

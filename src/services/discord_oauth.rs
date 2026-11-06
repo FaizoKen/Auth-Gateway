@@ -33,6 +33,57 @@ pub struct DiscordOAuth {
     http: reqwest::Client,
 }
 
+/// Why trading a refresh token failed.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// Discord answered `invalid_grant`: this refresh token will never work
+    /// again. The user de-authorized the app, or the token was already used.
+    Revoked(String),
+    /// Anything else. The token may well still be valid, so it is kept and
+    /// tried again later.
+    Other(String),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshError::Revoked(detail) => write!(f, "refresh token revoked: {detail}"),
+            RefreshError::Other(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OAuthErrorBody {
+    #[serde(default)]
+    error: String,
+}
+
+/// Classify a non-2xx answer from Discord's token endpoint. Only a 400/401
+/// whose OAuth error is `invalid_grant` is a dead token. `invalid_client`
+/// (our own credentials) is deliberately NOT one: a bad secret in a deploy
+/// would otherwise throw away every user's token at once.
+pub fn classify_refresh_failure(status: u16, body: &str) -> RefreshError {
+    let detail = format!(
+        "Discord token refresh returned {status}: {}",
+        body_excerpt(body)
+    );
+    if status == 400 || status == 401 {
+        let error = serde_json::from_str::<OAuthErrorBody>(body)
+            .map(|b| b.error)
+            .unwrap_or_default();
+        if error == "invalid_grant" {
+            return RefreshError::Revoked(detail);
+        }
+    }
+    RefreshError::Other(detail)
+}
+
+/// Enough of an error body to read in a log line, never a whole HTML page.
+fn body_excerpt(body: &str) -> String {
+    body.chars().take(200).collect()
+}
+
 impl DiscordOAuth {
     pub fn with_client(http: reqwest::Client) -> Self {
         Self { http }
@@ -85,12 +136,18 @@ impl DiscordOAuth {
         Ok((resp.access_token, resp.refresh_token))
     }
 
+    /// Trade a refresh token for a new access + refresh token pair.
+    ///
+    /// Only Discord saying `invalid_grant` means the token is gone for good
+    /// (see [`classify_refresh_failure`]). Everything else — no answer, a
+    /// rate limit, a Discord 5xx, a body we can't read — leaves the token as
+    /// good as it was, and the caller must keep it.
     pub async fn refresh_access_token(
         &self,
         config: &AppConfig,
         refresh_token: &str,
-    ) -> Result<(String, String), AppError> {
-        let resp: TokenResponse = self
+    ) -> Result<(String, String), RefreshError> {
+        let resp = self
             .http
             .post("https://discord.com/api/v10/oauth2/token")
             .form(&[
@@ -101,16 +158,23 @@ impl DiscordOAuth {
             ])
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Discord token refresh failed: {e}")))?
+            .map_err(|e| RefreshError::Other(format!("Discord token refresh failed: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_refresh_failure(status.as_u16(), &body));
+        }
+
+        let parsed: TokenResponse = resp
             .json()
             .await
-            .map_err(|e| AppError::Internal(format!("Discord token refresh parse failed: {e}")))?;
-
-        let new_refresh = resp.refresh_token.ok_or_else(|| {
-            AppError::Internal("Discord token refresh returned no refresh_token".into())
+            .map_err(|e| RefreshError::Other(format!("Discord token refresh parse failed: {e}")))?;
+        let new_refresh = parsed.refresh_token.ok_or_else(|| {
+            RefreshError::Other("Discord token refresh returned no refresh_token".into())
         })?;
 
-        Ok((resp.access_token, new_refresh))
+        Ok((parsed.access_token, new_refresh))
     }
 
     pub async fn get_user(&self, access_token: &str) -> Result<(String, String), AppError> {
@@ -120,6 +184,8 @@ impl DiscordOAuth {
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
+            .map_err(|e| AppError::Internal(format!("Discord user fetch failed: {e}")))?
+            .error_for_status()
             .map_err(|e| AppError::Internal(format!("Discord user fetch failed: {e}")))?
             .json()
             .await
@@ -143,6 +209,8 @@ impl DiscordOAuth {
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("Discord guilds fetch failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| AppError::Internal(format!("Discord guilds fetch failed: {e}")))?
             .json()
             .await
             .map_err(|e| AppError::Internal(format!("Discord guilds parse failed: {e}")))?;
@@ -157,5 +225,59 @@ impl DiscordOAuth {
                 (g.id, g.name, manage, g.icon)
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn revoked(r: &RefreshError) -> bool {
+        matches!(r, RefreshError::Revoked(_))
+    }
+
+    #[test]
+    fn invalid_grant_is_a_dead_token() {
+        let body = r#"{"error": "invalid_grant", "error_description": "Invalid \"refresh_token\" in request."}"#;
+        assert!(revoked(&classify_refresh_failure(400, body)));
+        assert!(revoked(&classify_refresh_failure(401, body)));
+    }
+
+    #[test]
+    fn our_own_credentials_being_rejected_keeps_every_token() {
+        // A wrong client secret after a deploy must not log everyone out.
+        let body = r#"{"error": "invalid_client"}"#;
+        assert!(!revoked(&classify_refresh_failure(401, body)));
+        assert!(!revoked(&classify_refresh_failure(400, body)));
+    }
+
+    #[test]
+    fn rate_limits_and_outages_keep_the_token() {
+        let limited =
+            r#"{"message": "You are being rate limited.", "retry_after": 1.2, "global": false}"#;
+        assert!(!revoked(&classify_refresh_failure(429, limited)));
+        assert!(!revoked(&classify_refresh_failure(500, "")));
+        assert!(!revoked(&classify_refresh_failure(
+            502,
+            "<html>Bad gateway</html>"
+        )));
+        assert!(!revoked(&classify_refresh_failure(
+            503,
+            "upstream connect error"
+        )));
+        // A 400 we cannot read is not proof the token is dead either.
+        assert!(!revoked(&classify_refresh_failure(
+            400,
+            "<html>oops</html>"
+        )));
+    }
+
+    #[test]
+    fn log_detail_is_bounded() {
+        let huge = "x".repeat(10_000);
+        let RefreshError::Other(detail) = classify_refresh_failure(502, &huge) else {
+            panic!("a 502 is never a revocation");
+        };
+        assert!(detail.len() < 300);
     }
 }

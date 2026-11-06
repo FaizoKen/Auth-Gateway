@@ -11,15 +11,30 @@
 //!   server keeps seeing "you're not in that server" — the cache would
 //!   otherwise only update on their next login or after the 7-day sweep.
 //!
-//! On-demand refreshes are cooldown-gated. The gate is an atomic claim on
-//! `guilds_refreshed_at`, which also closes a correctness hole: Discord
-//! rotates the refresh token on every use, so two concurrent refreshes
-//! would invalidate each other's rotated token. The claim guarantees only
-//! one refresh runs per cooldown window.
+//! Both paths claim the user before refreshing: an atomic bump of
+//! `guilds_refreshed_at`. Discord rotates the refresh token on every use,
+//! so two concurrent refreshes would invalidate each other's rotated token,
+//! and the loser would read `invalid_grant` — which now means "revoked".
+//!
+//! ## Membership we can no longer verify
+//!
+//! `user_guilds` is only as true as the last time Discord confirmed it. A
+//! user whose refresh token is gone (they de-authorized the app, or signed
+//! in without one) can't be re-checked, so their rows are kept for
+//! [`UNVERIFIED_GRACE_DAYS`] after that last confirmation and then removed
+//! by [`expire_unverifiable`]. Signing in again restores them at once.
+//! Before this, those rows stayed forever: a banned member kept counting as
+//! a member, and an ex-manager kept `manage_guild`.
 
 use crate::error::AppError;
-use crate::services::discord_oauth::DiscordOAuth;
+use crate::services::discord_oauth::{DiscordOAuth, RefreshError};
 use crate::AppState;
+
+/// How long a user's guild list outlives the last moment Discord confirmed
+/// it, once the gateway can no longer refresh it. Two refresh cycles: long
+/// enough that losing a token is not losing every role overnight, short
+/// enough that nobody stays a "member" of a server they left.
+pub const UNVERIFIED_GRACE_DAYS: i32 = 14;
 
 /// Outcome of an on-demand refresh attempt.
 pub enum OnDemand {
@@ -28,6 +43,30 @@ pub enum OnDemand {
     /// No refresh ran — either we refreshed within the cooldown window or
     /// the user has no stored Discord refresh token.
     Skipped,
+}
+
+/// Why a refresh did not complete.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    /// Discord will never refresh this user's token again. It has been
+    /// forgotten; their guild list now ages out (see the module docs).
+    #[error("Discord refresh token revoked")]
+    Revoked,
+    /// Discord did not answer usefully this time (network, rate limit,
+    /// outage). The token is kept and the refresh should be retried later.
+    #[error("{0}")]
+    Retry(String),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+impl From<AppError> for SyncError {
+    fn from(e: AppError) -> Self {
+        match e {
+            AppError::Database(db) => SyncError::Database(db),
+            other => SyncError::Retry(other.to_string()),
+        }
+    }
 }
 
 /// Refresh the caller's guild list right now, subject to `cooldown_secs`.
@@ -41,7 +80,7 @@ pub async fn refresh_on_demand(
     state: &AppState,
     discord_id: &str,
     cooldown_secs: f64,
-) -> Result<OnDemand, AppError> {
+) -> Result<OnDemand, SyncError> {
     let claimed: Option<(String,)> = sqlx::query_as(
         "UPDATE discord_tokens \
          SET guilds_refreshed_at = now() \
@@ -65,15 +104,20 @@ pub async fn refresh_on_demand(
 
 /// Refresh a single user's guild list using their stored refresh token,
 /// then atomically replace their `user_guilds` rows. Shared by the
-/// background worker and the on-demand path.
+/// background worker and the on-demand path; the caller has already
+/// claimed the user.
 ///
-/// On an invalid refresh token the row is removed from `discord_tokens`
-/// (Discord won't let us refresh it again) and the error is propagated.
+/// - `invalid_grant` → [`SyncError::Revoked`]: the token row is deleted
+///   (only if it still holds the token we used — a sign-in that raced us
+///   stored a fresh one, which must survive). `user_guilds` is left as last
+///   confirmed and ages out.
+/// - Anything else Discord does wrong → [`SyncError::Retry`]: the token is
+///   kept. Nothing is written, so a failed fetch can never empty a list.
 pub async fn replace_user_guilds(
     state: &AppState,
     discord_id: &str,
     refresh_token: &str,
-) -> Result<usize, AppError> {
+) -> Result<usize, SyncError> {
     let oauth = DiscordOAuth::with_client(state.http.clone());
 
     // Get new access token (Discord invalidates old refresh token, returns new one)
@@ -82,14 +126,23 @@ pub async fn replace_user_guilds(
         .await
     {
         Ok(tokens) => tokens,
-        Err(e) => {
-            tracing::warn!(discord_id, "Refresh token invalid, removing: {e}");
-            let _ = sqlx::query("DELETE FROM discord_tokens WHERE discord_id = $1")
-                .bind(discord_id)
-                .execute(&state.pool)
-                .await;
-            return Err(e);
+        Err(RefreshError::Revoked(detail)) => {
+            let forgotten = sqlx::query(
+                "DELETE FROM discord_tokens WHERE discord_id = $1 AND refresh_token = $2",
+            )
+            .bind(discord_id)
+            .bind(refresh_token)
+            .execute(&state.pool)
+            .await?
+            .rows_affected();
+            tracing::warn!(
+                discord_id,
+                forgotten = forgotten > 0,
+                "Discord refresh token revoked; guild list now expires in {UNVERIFIED_GRACE_DAYS} days unless they sign in again: {detail}"
+            );
+            return Err(SyncError::Revoked);
         }
+        Err(RefreshError::Other(detail)) => return Err(SyncError::Retry(detail)),
     };
 
     // Store the new refresh token immediately (old one is now invalid)
@@ -103,7 +156,21 @@ pub async fn replace_user_guilds(
     let guilds = oauth.get_user_guilds(&access_token).await?;
     let (_id, display_name) = oauth.get_user(&access_token).await?;
 
-    // Replace guild memberships atomically
+    store_user_guilds(state, discord_id, &display_name, &guilds).await?;
+
+    tracing::debug!(discord_id, guilds = guilds.len(), "Guild list refreshed");
+    Ok(guilds.len())
+}
+
+/// Replace a user's `user_guilds` rows with what Discord just confirmed —
+/// including with nothing, when they are in no server — and record the
+/// refresh. One transaction. Shared with the sign-in callback.
+pub async fn store_user_guilds(
+    state: &AppState,
+    discord_id: &str,
+    display_name: &str,
+    guilds: &[(String, String, bool, Option<String>)],
+) -> Result<(), AppError> {
     let mut tx = state.pool.begin().await?;
 
     // Snapshot the previous guild set so the optout helper can detect
@@ -127,7 +194,7 @@ pub async fn replace_user_guilds(
              SELECT $1, $2, UNNEST($3::text[]), UNNEST($4::text[]), UNNEST($5::bool[]), UNNEST($6::text[]), now()",
         )
         .bind(discord_id)
-        .bind(&display_name)
+        .bind(display_name)
         .bind(&guild_ids)
         .bind(&guild_names)
         .bind(&manage_flags)
@@ -150,7 +217,25 @@ pub async fn replace_user_guilds(
         .await?;
 
     tx.commit().await?;
+    Ok(())
+}
 
-    tracing::debug!(discord_id, guilds = guilds.len(), "Guild list refreshed");
-    Ok(guilds.len())
+/// Remove guild lists the gateway can no longer verify: users with no
+/// refresh token on file whose rows Discord last confirmed more than
+/// [`UNVERIFIED_GRACE_DAYS`] ago. Users who still have a token are never
+/// touched here, however long their refreshes keep failing — a bug or an
+/// outage on our side must not empty everyone's list. Returns rows removed.
+pub async fn expire_unverifiable(state: &AppState) -> Result<u64, sqlx::Error> {
+    let removed = sqlx::query(
+        "DELETE FROM user_guilds ug \
+         WHERE ug.updated_at < now() - make_interval(days => $1) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM discord_tokens dt WHERE dt.discord_id = ug.discord_id \
+           )",
+    )
+    .bind(UNVERIFIED_GRACE_DAYS)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    Ok(removed)
 }
