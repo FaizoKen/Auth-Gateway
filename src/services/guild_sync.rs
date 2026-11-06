@@ -127,20 +127,7 @@ pub async fn replace_user_guilds(
     {
         Ok(tokens) => tokens,
         Err(RefreshError::Revoked(detail)) => {
-            let forgotten = sqlx::query(
-                "DELETE FROM discord_tokens WHERE discord_id = $1 AND refresh_token = $2",
-            )
-            .bind(discord_id)
-            .bind(refresh_token)
-            .execute(&state.pool)
-            .await?
-            .rows_affected();
-            tracing::warn!(
-                discord_id,
-                forgotten = forgotten > 0,
-                "Discord refresh token revoked; guild list now expires in {UNVERIFIED_GRACE_DAYS} days unless they sign in again: {detail}"
-            );
-            return Err(SyncError::Revoked);
+            return Err(forget_token(state, discord_id, refresh_token, &detail).await?);
         }
         Err(RefreshError::Other(detail)) => return Err(SyncError::Retry(detail)),
     };
@@ -153,13 +140,57 @@ pub async fn replace_user_guilds(
         .await?;
 
     // Fetch guild list and current display name
-    let guilds = oauth.get_user_guilds(&access_token).await?;
+    let guilds = match oauth.get_user_guilds(&access_token).await {
+        Ok(guilds) => guilds,
+        // The token refreshes but Discord won't show it the user's servers:
+        // it was granted without the `guilds` scope (refresh tokens were
+        // consolidated from older plugin logins). Refreshing it again can
+        // never work, and a user who still has a token is never expired, so
+        // keeping it would freeze their list for good. Signing in again asks
+        // for the scope.
+        Err(AppError::Unauthorized) => {
+            return Err(forget_token(
+                state,
+                discord_id,
+                &new_refresh_token,
+                "the token cannot read the user's servers (no guilds scope)",
+            )
+            .await?);
+        }
+        Err(e) => return Err(e.into()),
+    };
     let (_id, display_name) = oauth.get_user(&access_token).await?;
 
     store_user_guilds(state, discord_id, &display_name, &guilds).await?;
 
     tracing::debug!(discord_id, guilds = guilds.len(), "Guild list refreshed");
     Ok(guilds.len())
+}
+
+/// Forget a refresh token that can never refresh this user's guild list,
+/// but only if it is still the stored one — a sign-in that raced us stored
+/// a fresh token, which must survive. The guild list stays as last
+/// confirmed and ages out (see [`expire_unverifiable`]). Always answers
+/// [`SyncError::Revoked`] for the caller to return.
+async fn forget_token(
+    state: &AppState,
+    discord_id: &str,
+    token: &str,
+    reason: &str,
+) -> Result<SyncError, sqlx::Error> {
+    let forgotten =
+        sqlx::query("DELETE FROM discord_tokens WHERE discord_id = $1 AND refresh_token = $2")
+            .bind(discord_id)
+            .bind(token)
+            .execute(&state.pool)
+            .await?
+            .rows_affected();
+    tracing::warn!(
+        discord_id,
+        forgotten = forgotten > 0,
+        "Discord token unusable; guild list now expires in {UNVERIFIED_GRACE_DAYS} days unless they sign in again: {reason}"
+    );
+    Ok(SyncError::Revoked)
 }
 
 /// Replace a user's `user_guilds` rows with what Discord just confirmed —

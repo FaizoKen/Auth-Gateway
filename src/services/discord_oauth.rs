@@ -198,17 +198,25 @@ impl DiscordOAuth {
     /// Returns `(guild_id, guild_name, manage_guild, icon_hash)` for each guild the user belongs to.
     /// `manage_guild` is true if the user is the guild owner or has the MANAGE_GUILD permission bit.
     /// `icon_hash` is `None` when the server has no custom icon.
+    ///
+    /// [`AppError::Unauthorized`] means Discord refused this access token for
+    /// the guild list outright — a token granted without the `guilds` scope.
+    /// Every other failure is [`AppError::Internal`].
     pub async fn get_user_guilds(
         &self,
         access_token: &str,
     ) -> Result<Vec<(String, String, bool, Option<String>)>, AppError> {
-        let guilds: Vec<DiscordGuild> = self
+        let resp = self
             .http
             .get("https://discord.com/api/v10/users/@me/guilds")
             .header("Authorization", format!("Bearer {access_token}"))
             .send()
             .await
-            .map_err(|e| AppError::Internal(format!("Discord guilds fetch failed: {e}")))?
+            .map_err(|e| AppError::Internal(format!("Discord guilds fetch failed: {e}")))?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(AppError::Unauthorized);
+        }
+        let guilds: Vec<DiscordGuild> = resp
             .error_for_status()
             .map_err(|e| AppError::Internal(format!("Discord guilds fetch failed: {e}")))?
             .json()
