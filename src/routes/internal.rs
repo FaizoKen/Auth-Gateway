@@ -51,6 +51,13 @@ pub struct UserGuildIdsQuery {
     /// filtered out. Absent for legacy callers — they get the unfiltered
     /// list (master opt-out still applies for consistency).
     pub plugin: Option<String>,
+    /// `true` = every guild the user is a member of, paused or not. For
+    /// membership checks ("is this user in the server?"): a pause decides
+    /// whether plugins give roles there, not whether the user is a member,
+    /// and most pauses are a default nobody chose (see `optout`). Absent or
+    /// `false` keeps the historical answer.
+    #[serde(default)]
+    pub include_paused: bool,
 }
 
 /// GET /auth/internal/user_guild_ids?discord_id=...[&plugin=<slug>]
@@ -63,7 +70,7 @@ pub struct UserGuildIdsQuery {
 /// for that specific plugin or via the guild-wide master toggle — is
 /// excluded. Absence of an opt-out row means opted-in, which preserves
 /// the pre-existing behavior for users who have never touched their
-/// preferences.
+/// preferences. `include_paused=true` answers plain membership instead.
 pub async fn user_guild_ids(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -74,19 +81,21 @@ pub async fn user_guild_ids(
     // Anti-join against the opt-out table: the empty plugin slug stands
     // for the guild-wide master toggle, and a row keyed on the caller's
     // plugin slug is the per-plugin override. Either disables the guild.
+    // `include_paused` ($3) skips the anti-join: plain membership.
     let plugin = query.plugin.unwrap_or_default();
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT ug.guild_id FROM user_guilds ug \
          WHERE ug.discord_id = $1 \
-           AND NOT EXISTS ( \
+           AND ($3 OR NOT EXISTS ( \
              SELECT 1 FROM user_guild_optouts o \
              WHERE o.discord_id = ug.discord_id \
                AND o.guild_id   = ug.guild_id \
                AND o.plugin IN ('', $2) \
-           )",
+           ))",
     )
     .bind(&query.discord_id)
     .bind(&plugin)
+    .bind(query.include_paused)
     .fetch_all(&state.pool)
     .await?;
 
@@ -215,13 +224,24 @@ pub async fn guild_optout_ids(
 
 #[cfg(test)]
 mod tests {
-    use super::GuildOptoutIdsQuery;
+    use super::{GuildOptoutIdsQuery, UserGuildIdsQuery};
     use axum::extract::Query;
     use axum::http::Uri;
 
     fn parse(q: &str) -> GuildOptoutIdsQuery {
         let uri: Uri = format!("/auth/internal/guild_optout_ids?{q}").parse().unwrap();
         Query::<GuildOptoutIdsQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    fn parse_user(q: &str) -> UserGuildIdsQuery {
+        let uri: Uri = format!("/auth/internal/user_guild_ids?{q}").parse().unwrap();
+        Query::<UserGuildIdsQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn user_guild_ids_still_leaves_out_paused_guilds_unless_asked() {
+        assert!(!parse_user("discord_id=1&plugin=stripe-subscriber-role").include_paused);
+        assert!(parse_user("discord_id=1&plugin=form-respondent-role&include_paused=true").include_paused);
     }
 
     #[test]
