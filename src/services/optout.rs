@@ -54,6 +54,29 @@ pub async fn set_auto_enable_new_guilds(
     Ok(())
 }
 
+/// `user_guild_optouts.source` for a pause the user made themselves.
+pub const SOURCE_USER: &str = "user";
+/// `user_guild_optouts.source` for a pause applied by default to a user who
+/// never chose: they have no `auto_enable_new_guilds` setting at all.
+pub const SOURCE_AUTO: &str = "auto";
+
+/// Whether a newly-seen guild starts paused, and on whose say-so, given the
+/// user's stored `auto_enable_new_guilds` (`None` = never set).
+///
+/// - `Some(true)`: not paused.
+/// - `Some(false)`: paused, and it is the user's choice — they turned
+///   auto-enable off themselves.
+/// - `None`: paused by default. Plugins that build their member list from
+///   their own records may ask the gateway to skip these, because nobody
+///   decided them (see `guild_optout_ids`).
+pub fn new_guild_pause_source(auto_enable: Option<bool>) -> Option<&'static str> {
+    match auto_enable {
+        Some(true) => None,
+        Some(false) => Some(SOURCE_USER),
+        None => Some(SOURCE_AUTO),
+    }
+}
+
 /// Snapshot the guild IDs currently recorded for a user. Call this
 /// before the worker / OAuth callback wipes and re-inserts `user_guilds`
 /// so [`apply_optouts_for_new_guilds`] can tell what's brand new.
@@ -99,30 +122,51 @@ pub async fn apply_optouts_for_new_guilds(
     .fetch_optional(&mut **tx)
     .await?;
 
-    // Default FALSE: no row, or row says FALSE → insert opt-outs.
-    // Only a row that explicitly says TRUE skips the opt-out step.
-    if setting.map(|(b,)| b).unwrap_or(false) {
+    let Some(source) = new_guild_pause_source(setting.map(|(b,)| b)) else {
         return Ok(());
-    }
+    };
 
     // Empty `plugin` slug is the guild-wide master toggle that overrides
     // every plugin in that guild — exactly what we want for the implicit
-    // opt-out applied to newly-joined guilds.
+    // opt-out applied to newly-joined guilds. DO NOTHING keeps a pause the
+    // user already chose marked as theirs.
     sqlx::query(
-        "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin) \
-         SELECT $1, UNNEST($2::text[]), '' \
+        "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin, source) \
+         SELECT $1, UNNEST($2::text[]), '', $3 \
          ON CONFLICT (discord_id, guild_id, plugin) DO NOTHING",
     )
     .bind(discord_id)
     .bind(&truly_new)
+    .bind(source)
     .execute(&mut **tx)
     .await?;
 
     tracing::info!(
         discord_id,
         new_guilds = truly_new.len(),
+        source,
         "Auto-opted out of newly-joined guilds (auto_enable_new_guilds = false)",
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_enable_on_pauses_nothing() {
+        assert_eq!(new_guild_pause_source(Some(true)), None);
+    }
+
+    #[test]
+    fn auto_enable_turned_off_is_the_users_choice() {
+        assert_eq!(new_guild_pause_source(Some(false)), Some(SOURCE_USER));
+    }
+
+    #[test]
+    fn never_set_is_a_default_nobody_chose() {
+        assert_eq!(new_guild_pause_source(None), Some(SOURCE_AUTO));
+    }
 }

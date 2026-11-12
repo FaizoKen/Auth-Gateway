@@ -257,15 +257,18 @@ pub async fn update_preference(
         .execute(&state.pool)
         .await?;
     } else {
+        // The user flipped this switch, so the pause is theirs even if the
+        // default had already paused the server (`source` 'auto' -> 'user').
         sqlx::query(
-            "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin, source) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (discord_id, guild_id, plugin) \
-             DO UPDATE SET updated_at = now()",
+             DO UPDATE SET updated_at = now(), source = EXCLUDED.source",
         )
         .bind(&discord_id)
         .bind(&body.guild_id)
         .bind(&plugin_slug)
+        .bind(optout::SOURCE_USER)
         .execute(&state.pool)
         .await?;
     }
@@ -317,13 +320,16 @@ pub async fn bulk_update_preference(
     } else {
         // Insert a master opt-out for every guild the user is currently
         // in. Idempotent via ON CONFLICT so repeat clicks don't churn.
+        // "Pause all" is the user's choice for every server it touches,
+        // including ones the default had already paused.
         let res = sqlx::query(
-            "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin) \
-             SELECT $1, guild_id, '' FROM user_guilds WHERE discord_id = $1 \
+            "INSERT INTO user_guild_optouts (discord_id, guild_id, plugin, source) \
+             SELECT $1, guild_id, '', $2 FROM user_guilds WHERE discord_id = $1 \
              ON CONFLICT (discord_id, guild_id, plugin) \
-             DO UPDATE SET updated_at = now()",
+             DO UPDATE SET updated_at = now(), source = EXCLUDED.source",
         )
         .bind(&discord_id)
+        .bind(optout::SOURCE_USER)
         .execute(&state.pool)
         .await?;
         res.rows_affected() as i64

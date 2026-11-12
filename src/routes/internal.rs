@@ -162,6 +162,12 @@ pub struct GuildOptoutIdsQuery {
     /// Plugin slug. A member is "opted out" of this guild when they hold a
     /// guild-wide master opt-out (empty slug) OR a `plugin=<slug>` override.
     pub plugin: Option<String>,
+    /// `true` = only pauses the user made themselves (`source = 'user'`),
+    /// leaving out the ones applied by default to users who never chose
+    /// (`source = 'auto'`, see `optout::new_guild_pause_source`). Absent or
+    /// `false` keeps the historical answer: every pause.
+    #[serde(default)]
+    pub explicit_only: bool,
 }
 
 /// GET /auth/internal/guild_optout_ids?guild_id=...[&plugin=<slug>]
@@ -175,6 +181,10 @@ pub struct GuildOptoutIdsQuery {
 /// opted-out users, so the centralized opt-out system is still honored even
 /// for members the gateway has never seen log in. Authenticated by the shared
 /// `INTERNAL_API_KEY` like the other `/auth/internal/*` endpoints.
+///
+/// `explicit_only=true` is for those same plugins: their member did something
+/// in this server's name (a subscription carrying their Discord id), which a
+/// default nobody chose must not overrule. A pause the user made still wins.
 pub async fn guild_optout_ids(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -183,12 +193,16 @@ pub async fn guild_optout_ids(
     verify_internal_key(&headers, &state.config.internal_api_key)?;
 
     let plugin = query.plugin.unwrap_or_default();
+    // `NOT $3 OR ...` keeps one statement for both answers; $3 = false
+    // reads every pause, as before the column existed.
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT o.discord_id FROM user_guild_optouts o \
-         WHERE o.guild_id = $1 AND o.plugin IN ('', $2)",
+         WHERE o.guild_id = $1 AND o.plugin IN ('', $2) \
+           AND (NOT $3 OR o.source = 'user')",
     )
     .bind(&query.guild_id)
     .bind(&plugin)
+    .bind(query.explicit_only)
     .fetch_all(&state.pool)
     .await?;
 
@@ -197,4 +211,27 @@ pub async fn guild_optout_ids(
     Ok(axum::Json(serde_json::json!({
         "discord_ids": discord_ids,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuildOptoutIdsQuery;
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    fn parse(q: &str) -> GuildOptoutIdsQuery {
+        let uri: Uri = format!("/auth/internal/guild_optout_ids?{q}").parse().unwrap();
+        Query::<GuildOptoutIdsQuery>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn callers_that_do_not_ask_still_get_every_pause() {
+        assert!(!parse("guild_id=1&plugin=form-respondent-role").explicit_only);
+    }
+
+    #[test]
+    fn explicit_only_is_read_from_the_query() {
+        assert!(parse("guild_id=1&plugin=stripe-subscriber-role&explicit_only=true").explicit_only);
+        assert!(!parse("guild_id=1&explicit_only=false").explicit_only);
+    }
 }
